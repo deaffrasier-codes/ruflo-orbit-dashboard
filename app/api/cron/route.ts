@@ -4,6 +4,58 @@ const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY!
 const IG_ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN!
 const IG_USER_ID = process.env.INSTAGRAM_USER_ID!
 
+// ── TikTok ─────────────────────────────────────────────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getTikTokToken(supabase: any): Promise<string | null> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data } = await (supabase as any).from('app_secrets').select('value, expires_at').eq('key', 'tiktok_access_token').single() as { data: { value: string; expires_at: string } | null }
+  if (!data) return null
+
+  // Refresh if expiring within 2 hours
+  const expiresAt = new Date(data.expires_at)
+  if (expiresAt.getTime() - Date.now() < 2 * 60 * 60 * 1000) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: refresh } = await (supabase as any).from('app_secrets').select('value').eq('key', 'tiktok_refresh_token').single() as { data: { value: string } | null }
+    if (!refresh) return data.value
+
+    const res = await fetch('https://open.tiktokapis.com/v2/oauth/token/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_key: process.env.TIKTOK_CLIENT_KEY!,
+        client_secret: process.env.TIKTOK_CLIENT_SECRET!,
+        grant_type: 'refresh_token',
+        refresh_token: refresh.value,
+      }),
+    })
+    const newToken = await res.json()
+    if (newToken.access_token) {
+      const expiresAt = new Date(Date.now() + newToken.expires_in * 1000).toISOString()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any).from('app_secrets').upsert({ key: 'tiktok_access_token', value: newToken.access_token, expires_at: expiresAt })
+      return newToken.access_token
+    }
+  }
+  return data.value
+}
+
+async function fetchTikTokVideos(token: string, openId: string): Promise<{ id: string; views: number; likes: number; comments: number; shares: number }[]> {
+  const res = await fetch('https://open.tiktokapis.com/v2/video/list/?fields=id,view_count,like_count,comment_count,share_count', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ max_count: 20 }),
+  })
+  const data = await res.json()
+  return (data.data?.videos ?? []).map((v: { id: string; view_count: number; like_count: number; comment_count: number; share_count: number }) => ({
+    id: v.id,
+    views: v.view_count ?? 0,
+    likes: v.like_count ?? 0,
+    comments: v.comment_count ?? 0,
+    shares: v.share_count ?? 0,
+  }))
+}
+
 // ── YouTube ────────────────────────────────────────────────────────────────
 
 async function fetchYouTubeViews(videoIds: string[]): Promise<Record<string, { views: number; likes: number; comments: number }>> {
@@ -128,6 +180,33 @@ export async function GET(req: Request) {
       await supabase.from('songs').update({ views_instagram: total }).eq('id', song_id)
     }
     log.push(`Instagram: updated ${igPosts.length} posts`)
+  }
+
+  // ── TikTok ───────────────────────────────────────────────────────────────
+  const ttToken = await getTikTokToken(supabase)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data: openIdRow } = await (supabase as any).from('app_secrets').select('value').eq('key', 'tiktok_open_id').single() as { data: { value: string } | null }
+
+  if (ttToken && openIdRow?.value) {
+    const ttVideos = await fetchTikTokVideos(ttToken, openIdRow.value)
+    const { data: ttDbVideos } = await supabase.from('videos').select('id, song_id, video_id, views').eq('platform', 'tiktok')
+
+    for (const post of ttVideos) {
+      const match = ttDbVideos?.find((v: { video_id: string }) => v.video_id === post.id)
+      if (!match) continue
+      await supabase.from('videos').update({ views: post.views, likes: post.likes, comments: post.comments, shares: post.shares }).eq('id', match.id)
+    }
+
+    // Roll up TikTok views per song
+    const { data: allTt } = await supabase.from('videos').select('song_id, views').eq('platform', 'tiktok')
+    const ttTotals: Record<string, number> = {}
+    for (const v of allTt ?? []) {
+      ttTotals[v.song_id] = (ttTotals[v.song_id] ?? 0) + v.views
+    }
+    for (const [song_id, total] of Object.entries(ttTotals)) {
+      await supabase.from('songs').update({ views_tiktok: total }).eq('id', song_id)
+    }
+    log.push(`TikTok: updated ${ttVideos.length} videos`)
   }
 
   return Response.json({ ok: true, log })
