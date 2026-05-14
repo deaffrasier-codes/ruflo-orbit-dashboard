@@ -3,11 +3,13 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import { Card } from '@/components/ui/card'
-import { StageBadge } from '@/components/stage-badge'
+import { Button } from '@/components/ui/button'
+import { ScanMatchModal } from '@/components/scan-match-modal'
 import type { Song } from '@/types/database'
 
 export default function AnalyticsPage() {
   const [songs, setSongs] = useState<Song[]>([])
+  const [scanOpen, setScanOpen] = useState(false)
 
   useEffect(() => {
     supabase.from('songs').select('*').eq('status', 'published').order('views_youtube', { ascending: false })
@@ -21,7 +23,13 @@ export default function AnalyticsPage() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold">Analytics</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-bold">Analytics</h2>
+        <Button size="sm" variant="outline" onClick={() => setScanOpen(true)} className="gap-2 text-xs">
+          Scan & Match YouTube
+        </Button>
+      </div>
+      <ScanMatchModal open={scanOpen} onClose={() => setScanOpen(false)} />
 
       {/* Platform totals */}
       <div className="grid grid-cols-4 gap-4">
