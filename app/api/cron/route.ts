@@ -1,23 +1,62 @@
 import { createClient } from '@supabase/supabase-js'
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY!
-const YOUTUBE_STATS_URL = 'https://www.googleapis.com/youtube/v3/videos'
+const IG_ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN!
+const IG_USER_ID = process.env.INSTAGRAM_USER_ID!
 
-async function fetchYouTubeStats(videoIds: string[]): Promise<Record<string, number>> {
+// ── YouTube ────────────────────────────────────────────────────────────────
+
+async function fetchYouTubeViews(videoIds: string[]): Promise<Record<string, { views: number; likes: number; comments: number }>> {
   if (!videoIds.length) return {}
   const ids = videoIds.join(',')
-  const url = `${YOUTUBE_STATS_URL}?part=statistics&id=${ids}&key=${YOUTUBE_API_KEY}`
+  const url = `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${ids}&key=${YOUTUBE_API_KEY}`
   const res = await fetch(url)
   const data = await res.json()
-  const result: Record<string, number> = {}
+  const result: Record<string, { views: number; likes: number; comments: number }> = {}
   for (const item of data.items ?? []) {
-    result[item.id] = parseInt(item.statistics?.viewCount ?? '0', 10)
+    result[item.id] = {
+      views: parseInt(item.statistics?.viewCount ?? '0', 10),
+      likes: parseInt(item.statistics?.likeCount ?? '0', 10),
+      comments: parseInt(item.statistics?.commentCount ?? '0', 10),
+    }
   }
   return result
 }
 
+// ── Instagram ──────────────────────────────────────────────────────────────
+
+async function fetchInstagramMedia(): Promise<{ id: string; views: number; likes: number; comments: number }[]> {
+  if (!IG_ACCESS_TOKEN || !IG_USER_ID) return []
+  const fields = 'id,media_type,timestamp,like_count,comments_count'
+  const url = `https://graph.facebook.com/v21.0/${IG_USER_ID}/media?fields=${fields}&access_token=${IG_ACCESS_TOKEN}`
+  const res = await fetch(url)
+  const data = await res.json()
+  if (!data.data) return []
+
+  const results = []
+  for (const post of data.data.slice(0, 20)) {
+    // Fetch insights (plays/views) for Reels
+    let views = 0
+    if (post.media_type === 'VIDEO' || post.media_type === 'REEL') {
+      const insightUrl = `https://graph.facebook.com/v21.0/${post.id}/insights?metric=plays,reach&access_token=${IG_ACCESS_TOKEN}`
+      const ir = await fetch(insightUrl)
+      const id = await ir.json()
+      const playsMetric = id.data?.find((m: { name: string; values: { value: number }[] }) => m.name === 'plays')
+      views = playsMetric?.values?.[0]?.value ?? 0
+    }
+    results.push({
+      id: post.id,
+      views,
+      likes: post.like_count ?? 0,
+      comments: post.comments_count ?? 0,
+    })
+  }
+  return results
+}
+
+// ── Main cron handler ──────────────────────────────────────────────────────
+
 export async function GET(req: Request) {
-  // Verify this is called by Vercel Cron (not random public traffic)
   const authHeader = req.headers.get('authorization')
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return new Response('Unauthorised', { status: 401 })
@@ -28,44 +67,68 @@ export async function GET(req: Request) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
   )
 
-  const { data: songs, error } = await supabase
-    .from('songs')
-    .select('id, name, youtube_video_id, views_youtube')
-    .not('youtube_video_id', 'is', null)
+  const log: string[] = []
 
-  if (error) return Response.json({ error: error.message }, { status: 500 })
+  // ── YouTube: update videos table ─────────────────────────────────────────
+  const { data: ytVideos } = await supabase
+    .from('videos')
+    .select('id, song_id, video_id, views')
+    .eq('platform', 'youtube')
 
-  const videoIds = (songs ?? []).map((s: { youtube_video_id: string }) => s.youtube_video_id).filter(Boolean)
-  const ytStats = await fetchYouTubeStats(videoIds)
+  if (ytVideos?.length) {
+    const ids = ytVideos.map((v: { video_id: string }) => v.video_id)
+    const stats = await fetchYouTubeViews(ids)
 
-  const updates: { song: string; views: number; prev: number }[] = []
+    for (const v of ytVideos) {
+      const s = stats[v.video_id]
+      if (!s) continue
+      await supabase.from('videos').update({ views: s.views, likes: s.likes, comments: s.comments }).eq('id', v.id)
+      await supabase.from('analytics_snapshots').insert({ song_id: v.song_id, platform: 'youtube', views: s.views, likes: s.likes, comments: s.comments, shares: 0 })
 
-  for (const song of songs ?? []) {
-    const newViews = ytStats[song.youtube_video_id] ?? song.views_youtube
-    if (newViews === song.views_youtube) continue
-
-    await supabase.from('songs').update({ views_youtube: newViews }).eq('id', song.id)
-
-    // Snapshot for history
-    await supabase.from('analytics_snapshots').insert({
-      song_id: song.id,
-      platform: 'youtube',
-      views: newViews,
-      likes: 0,
-      comments: 0,
-      shares: 0,
-    })
-
-    // Viral alert: if views jumped >20% since last check, flag it
-    const growth = song.views_youtube > 0
-      ? (newViews - song.views_youtube) / song.views_youtube
-      : 0
-    if (growth > 0.2) {
-      await supabase.from('songs').update({ viral_alert: true }).eq('id', song.id)
+      const growth = v.views > 0 ? (s.views - v.views) / v.views : 0
+      if (growth > 0.2) {
+        await supabase.from('songs').update({ viral_alert: true }).eq('id', v.song_id)
+        log.push(`VIRAL: ${v.video_id} grew ${Math.round(growth * 100)}%`)
+      }
     }
 
-    updates.push({ song: song.name, views: newViews, prev: song.views_youtube })
+    // Roll up total YT views per song
+    const { data: allYt } = await supabase.from('videos').select('song_id, views').eq('platform', 'youtube')
+    const songTotals: Record<string, number> = {}
+    for (const v of allYt ?? []) {
+      songTotals[v.song_id] = (songTotals[v.song_id] ?? 0) + v.views
+    }
+    for (const [song_id, total] of Object.entries(songTotals)) {
+      await supabase.from('songs').update({ views_youtube: total }).eq('id', song_id)
+    }
+    log.push(`YouTube: updated ${ytVideos.length} videos`)
   }
 
-  return Response.json({ updated: updates.length, updates })
+  // ── Instagram: update videos table ───────────────────────────────────────
+  const igPosts = await fetchInstagramMedia()
+  if (igPosts.length) {
+    const { data: igVideos } = await supabase
+      .from('videos')
+      .select('id, song_id, video_id, views')
+      .eq('platform', 'instagram')
+
+    for (const post of igPosts) {
+      const match = igVideos?.find((v: { video_id: string }) => v.video_id === post.id)
+      if (!match) continue
+      await supabase.from('videos').update({ views: post.views, likes: post.likes, comments: post.comments }).eq('id', match.id)
+    }
+
+    // Roll up IG views per song
+    const { data: allIg } = await supabase.from('videos').select('song_id, views').eq('platform', 'instagram')
+    const igTotals: Record<string, number> = {}
+    for (const v of allIg ?? []) {
+      igTotals[v.song_id] = (igTotals[v.song_id] ?? 0) + v.views
+    }
+    for (const [song_id, total] of Object.entries(igTotals)) {
+      await supabase.from('songs').update({ views_instagram: total }).eq('id', song_id)
+    }
+    log.push(`Instagram: updated ${igPosts.length} posts`)
+  }
+
+  return Response.json({ ok: true, log })
 }

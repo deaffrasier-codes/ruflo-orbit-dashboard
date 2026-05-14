@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { StageBadge } from '@/components/stage-badge'
+import { VideoList } from '@/components/video-list'
 import { supabase } from '@/lib/supabase'
 import { STAGES, SAGAS } from '@/lib/constants'
 import { toast } from 'sonner'
@@ -216,6 +217,11 @@ export function SongDetail({ song, onClose, onUpdate }: Props) {
               </div>
             </section>
           )}
+
+          {/* Videos */}
+          <section>
+            <VideoList songId={song.id} />
+          </section>
 
           {/* Notes */}
           <div>
