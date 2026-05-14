@@ -1,26 +1,34 @@
 // POST /api/import/distrokid
 // Accepts a DistroKid earnings CSV, parses it, upserts into distrokid_earnings table.
+// Actual DK column names: Date Inserted, Reporting Date, Sale Month, Store, Artist,
+// Title, ISRC, UPC, Quantity, Team Percentage, Source Type, Country of Sale,
+// Songwriter Royalties Withheld (USD), Earnings (USD), Recoup (USD)
 
 import { createClient } from '@supabase/supabase-js'
 import Papa from 'papaparse'
 
 interface DKRow {
+  'Date Inserted'?: string
   'Reporting Date'?: string
   'Sale Month'?: string
   'Store'?: string
-  'Country of Sale'?: string
-  'Quantity'?: string
-  'Song Title'?: string
+  'Artist'?: string
+  'Title'?: string
+  'Song Title'?: string  // older export format fallback
   'ISRC'?: string
   'UPC'?: string
-  'Earnings (USD)'?: string
+  'Quantity'?: string
   'Team Percentage'?: string
+  'Source Type'?: string
+  'Country of Sale'?: string
+  'Songwriter Royalties Withheld (USD)'?: string
+  'Earnings (USD)'?: string
+  'Recoup (USD)'?: string
   [key: string]: string | undefined
 }
 
 function parseDate(raw: string | undefined): string | null {
   if (!raw) return null
-  // Handle "January 2025" or "2025-01" or "2025-01-01"
   const monthNames: Record<string, string> = {
     January: '01', February: '02', March: '03', April: '04',
     May: '05', June: '06', July: '07', August: '08',
@@ -31,9 +39,10 @@ function parseDate(raw: string | undefined): string | null {
     const month = monthNames[longForm[1]]
     if (month) return `${longForm[2]}-${month}-01`
   }
+  // "2026-03" short ISO → first of month
   const isoShort = raw.match(/^(\d{4})-(\d{2})$/)
   if (isoShort) return `${raw}-01`
-  // Already ISO
+  // Full ISO date
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
   return null
 }
@@ -44,7 +53,6 @@ export async function POST(req: Request) {
   if (!file) return Response.json({ error: 'No file uploaded' }, { status: 400 })
 
   const text = await file.text()
-  // Strip BOM if present
   const csv = text.startsWith('\uFEFF') ? text.slice(1) : text
 
   const { data: rows, errors } = Papa.parse<DKRow>(csv, { header: true, skipEmptyLines: true })
@@ -57,7 +65,6 @@ export async function POST(req: Request) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
   )
 
-  // Load songs for ISRC matching
   const { data: songs } = await supabase.from('songs').select('id, name, isrc') as { data: { id: string; name: string; isrc: string | null }[] | null }
   const isrcMap: Record<string, string> = {}
   const titleMap: Record<string, string> = {}
@@ -70,13 +77,17 @@ export async function POST(req: Request) {
   for (const row of rows) {
     const earnings = parseFloat(row['Earnings (USD)'] ?? '0') || 0
     const quantity = parseInt(row['Quantity'] ?? '0', 10) || 0
-    const reportingDate = parseDate(row['Reporting Date'] ?? row['Sale Month'])
+
+    // Use Sale Month as the period (e.g. "2026-03" → "2026-03-01")
+    // Fall back to Reporting Date if Sale Month missing
+    const reportingDate = parseDate(row['Sale Month'] ?? row['Reporting Date'])
+    if (!reportingDate) continue
+
     const isrc = row['ISRC']?.toUpperCase() ?? null
-    const songTitle = row['Song Title'] ?? null
+    // DK new format uses "Title"; older format uses "Song Title"
+    const songTitle = row['Title'] ?? row['Song Title'] ?? null
     const store = row['Store'] ?? 'Unknown'
     const country = row['Country of Sale'] ?? null
-
-    if (!reportingDate) continue
 
     const songId = (isrc && isrcMap[isrc]) ?? (songTitle && titleMap[songTitle.toLowerCase()]) ?? null
 
