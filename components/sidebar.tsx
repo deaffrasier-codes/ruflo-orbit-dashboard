@@ -2,12 +2,13 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { LayoutGrid, BarChart2, MessageSquare } from 'lucide-react'
+import { LayoutGrid, BarChart2, MessageSquare, DollarSign } from 'lucide-react'
 
 const nav = [
-  { href: '/',         label: 'Pipeline',   icon: LayoutGrid },
-  { href: '/analytics', label: 'Analytics', icon: BarChart2 },
-  { href: '/chat',     label: 'AI Chat',    icon: MessageSquare },
+  { href: '/',          label: 'Pipeline',   icon: LayoutGrid },
+  { href: '/analytics', label: 'Analytics',  icon: BarChart2 },
+  { href: '/revenue',   label: 'Revenue',    icon: DollarSign },
+  { href: '/chat',      label: 'AI Chat',    icon: MessageSquare },
 ]
 
 export function Sidebar() {
